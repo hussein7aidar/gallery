@@ -4,6 +4,7 @@ import 'package:photo_manager/photo_manager.dart';
 import '../models/album.dart';
 import '../models/album_customization.dart';
 import '../models/album_stats.dart';
+import '../models/media_stack.dart';
 import '../models/sort_method.dart';
 import '../services/intent_service.dart';
 import '../services/media_service.dart';
@@ -52,6 +53,20 @@ class GalleryController extends ChangeNotifier {
   ThemeMode _themeMode = ThemeMode.system;
   ThemeMode get themeMode => _themeMode;
 
+  /// Days before binned items auto-delete (0 = never).
+  int _binRetentionDays = 30;
+  int get binRetentionDays => _binRetentionDays;
+
+  /// Allowed retention choices shown in settings (0 = never).
+  static const List<int> retentionChoices = [10, 15, 30, 60, 90, 0];
+
+  /// Hide media smaller than this many KB from the gallery (0 = off).
+  int _hideSmallMediaKb = 0;
+  int get hideSmallMediaKb => _hideSmallMediaKb;
+
+  /// Allowed small-media thresholds shown in settings (0 = off).
+  static const List<int> smallMediaChoices = [0, 2, 4, 6, 8];
+
   /// Raw albums as loaded from the device, keyed insertion-independent by id.
   List<Album> _albums = [];
 
@@ -61,7 +76,66 @@ class GalleryController extends ChangeNotifier {
   /// The user's manual album order (album ids). Locked album is excluded.
   List<String> _manualOrder = [];
 
+  /// Soft recycle bin: asset id → time it was binned (epoch ms). Binned items
+  /// are hidden from albums but not actually moved or deleted until the user
+  /// empties the bin.
+  Map<String, int> _binnedAt = {};
+
+  /// Soft recycle bin: asset id → the folder it was binned from, so each album's
+  /// count stays accurate and fully-binned albums disappear.
+  Map<String, String> _binnedPath = {};
+
+  /// Media stacks (groups of related photos), keyed by stack id.
+  Map<String, MediaStack> _stacks = {};
+
+  /// Reverse index: member asset id → its stack id.
+  final Map<String, String> _memberToStack = {};
+
+  /// Whether burst/original variants are auto-grouped by filename.
+  bool _autoStackByName = true;
+  bool get autoStackByName => _autoStackByName;
+
   bool get hasHiddenAlbums => _albums.any((a) => a.hidden);
+
+  /// The recycle bin is always available (it doesn't rely on MediaStore moves).
+  bool get binSupported => true;
+
+  /// Whether an asset is currently in the recycle bin.
+  bool isBinned(String id) => _binnedAt.containsKey(id);
+
+  /// Ids currently in the recycle bin.
+  Set<String> get binnedIds => _binnedAt.keys.toSet();
+
+  /// Whole days left before [id] auto-deletes, or null when retention is
+  /// "never" or the item isn't binned.
+  int? binDaysLeftFor(String id) {
+    if (_binRetentionDays <= 0) return null;
+    final at = _binnedAt[id];
+    if (at == null) return null;
+    final elapsedDays =
+        (DateTime.now().millisecondsSinceEpoch - at) ~/ (24 * 60 * 60 * 1000);
+    final left = _binRetentionDays - elapsedDays;
+    return left < 0 ? 0 : left;
+  }
+
+  /// Binned ids whose retention window has elapsed (empty when "never").
+  List<String> get expiredBinIds {
+    if (_binRetentionDays <= 0) return const [];
+    final cutoff = DateTime.now().millisecondsSinceEpoch -
+        _binRetentionDays * 24 * 60 * 60 * 1000;
+    return _binnedAt.entries
+        .where((e) => e.value < cutoff)
+        .map((e) => e.key)
+        .toList();
+  }
+
+  /// Permanently deletes any binned items past the retention window.
+  Future<int> purgeExpiredBin() async {
+    final expired = expiredBinIds;
+    if (expired.isEmpty) return 0;
+    final removed = await deleteForever(expired);
+    return removed.length;
+  }
 
   // ---------------------------------------------------------------------------
   // Loading
@@ -74,6 +148,13 @@ class GalleryController extends ChangeNotifier {
     _showHidden = await _settings.loadShowHidden();
     _manualOrder = await _settings.loadOrder();
     _customizations = await _settings.loadCustomizations();
+    _binnedAt = await _settings.loadBinnedAt();
+    _binnedPath = await _settings.loadBinnedPaths();
+    _binRetentionDays = await _settings.loadBinRetentionDays();
+    _hideSmallMediaKb = await _settings.loadHideSmallMediaKb();
+    _stacks = await _settings.loadStacks();
+    _autoStackByName = await _settings.loadAutoStackByName();
+    _rebuildStackIndex();
     await loadAlbums();
   }
 
@@ -92,7 +173,11 @@ class GalleryController extends ChangeNotifier {
         return;
       }
 
-      final loaded = await _media.loadAlbums();
+      final loaded = await _media.loadAlbums(
+        excludeIds: _binnedAt.keys.toSet(),
+        binnedByFolder: _binnedByFolder(),
+        minSizeBytes: _hideSmallMediaKb * 1024,
+      );
       // Re-attach saved customizations to freshly loaded albums.
       _albums = loaded
           .map((a) => a.isLocked
@@ -148,11 +233,13 @@ class GalleryController extends ChangeNotifier {
   // Derived: the ordered, filtered list the home page renders
   // ---------------------------------------------------------------------------
 
-  /// Albums to display: locked "All Photos" always pinned first, then the rest
+  /// Albums to display on the home page: locked "All Photos" pinned first, then
+  /// the user's own folders (auto-generated ones are grouped under "Others"),
   /// filtered by hidden state and ordered by the current sort method.
   List<Album> get visibleAlbums {
     final locked = _albums.where((a) => a.isLocked).toList();
-    var rest = _albums.where((a) => !a.isLocked).toList();
+    var rest =
+        _albums.where((a) => !a.isLocked && !a.isAutoGenerated).toList();
 
     if (!_showHidden) {
       rest = rest.where((a) => !a.hidden).toList();
@@ -161,6 +248,21 @@ class GalleryController extends ChangeNotifier {
     rest.sort(_comparator);
     return [...locked, ...rest];
   }
+
+  /// Auto-generated app/system albums (WhatsApp, Telegram, Screenshots, …),
+  /// always sorted A–Z. These live behind the "Others" tile.
+  List<Album> get otherAlbums {
+    var list = _albums.where((a) => a.isAutoGenerated).toList();
+    if (!_showHidden) {
+      list = list.where((a) => !a.hidden).toList();
+    }
+    list.sort((a, b) =>
+        a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()));
+    return list;
+  }
+
+  /// True when there is at least one auto-generated album to show under Others.
+  bool get hasOthers => otherAlbums.isNotEmpty;
 
   Comparator<Album> get _comparator {
     switch (_sort) {
@@ -212,6 +314,28 @@ class GalleryController extends ChangeNotifier {
     _themeMode = mode;
     await _settings.saveThemeMode(mode);
     notifyListeners();
+  }
+
+  Future<void> setViewMode(AlbumViewMode mode) async {
+    if (_viewMode == mode) return;
+    _viewMode = mode;
+    await _settings.saveViewMode(mode);
+    notifyListeners();
+  }
+
+  Future<void> setBinRetentionDays(int days) async {
+    _binRetentionDays = days;
+    await _settings.saveBinRetentionDays(days);
+    notifyListeners();
+  }
+
+  /// Sets the small-media threshold (KB) and reloads albums so the filter takes
+  /// effect immediately.
+  Future<void> setHideSmallMediaKb(int kb) async {
+    if (_hideSmallMediaKb == kb) return;
+    _hideSmallMediaKb = kb;
+    await _settings.saveHideSmallMediaKb(kb);
+    await loadAlbums();
   }
 
   // ---------------------------------------------------------------------------
@@ -312,9 +436,9 @@ class GalleryController extends ChangeNotifier {
     return total;
   }
 
-  /// Deletes an album by deleting all of its assets from the device. The caller
+  /// Deletes an album by moving all of its media to the recycle bin. The caller
   /// is responsible for showing the warning first. No-op on the locked album.
-  /// Returns the number of assets removed.
+  /// Returns the number of items moved to the bin.
   Future<int> deleteAlbum(Album album) async {
     if (!album.canEdit) return 0;
     final assets = <AssetEntity>[];
@@ -327,14 +451,12 @@ class GalleryController extends ChangeNotifier {
       if (batch.length < 200) break;
       page++;
     }
-    final ids = assets.map((a) => a.id).toList();
-    final removed = await _media.deleteAssets(ids);
+    final ok = await trashAssets(assets); // records metadata + reloads
     _customizations.remove(album.id);
     _manualOrder.remove(album.id);
     await _settings.saveCustomizations(_customizations);
     await _settings.saveOrder(_manualOrder);
-    await loadAlbums();
-    return removed.length;
+    return ok ? assets.length : 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -359,19 +481,251 @@ class GalleryController extends ChangeNotifier {
   }
 
   // ---------------------------------------------------------------------------
-  // Single-asset operations (from the photo viewer)
+  // Recycle bin (soft — no file moves)
   // ---------------------------------------------------------------------------
 
-  /// Deletes one asset from the device. Returns true if it was removed.
-  Future<bool> deleteAsset(String id) async {
-    final removed = await _media.deleteAssets([id]);
-    return removed.contains(id);
+  /// Binned counts per normalized folder, for accurate album counts.
+  Map<String, int> _binnedByFolder() {
+    final map = <String, int>{};
+    for (final path in _binnedPath.values) {
+      final key = MediaService.normalizeFolder(path);
+      map[key] = (map[key] ?? 0) + 1;
+    }
+    return map;
   }
 
-  /// Deletes several assets at once. Returns the ids that were removed.
-  Future<List<String>> deleteAssets(List<String> ids) async {
+  /// Marks the given assets as binned. They're hidden from albums everywhere but
+  /// stay on disk until restored or permanently deleted. Always succeeds.
+  Future<bool> trashAssets(List<AssetEntity> assets) async {
+    if (assets.isEmpty) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final asset in assets) {
+      _binnedAt[asset.id] = now;
+      _binnedPath[asset.id] = asset.relativePath ?? '';
+      _detachFromStack(asset.id); // a binned item leaves its stack
+    }
+    _rebuildStackIndex();
+    await _settings.saveBinnedAt(_binnedAt);
+    await _settings.saveBinnedPaths(_binnedPath);
+    await _settings.saveStacks(_stacks);
+    await loadAlbums(); // refresh covers/counts; empty albums disappear
+    return true;
+  }
+
+  /// Loads the recycle bin contents (newest-binned first). Drops ids whose
+  /// underlying asset no longer exists.
+  Future<List<AssetEntity>> loadBin() async {
+    final entries = _binnedAt.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final assets = <AssetEntity>[];
+    var changed = false;
+    for (final entry in entries) {
+      final asset = await AssetEntity.fromId(entry.key);
+      if (asset != null) {
+        assets.add(asset);
+      } else {
+        _binnedAt.remove(entry.key);
+        _binnedPath.remove(entry.key);
+        changed = true;
+      }
+    }
+    if (changed) {
+      await _settings.saveBinnedAt(_binnedAt);
+      await _settings.saveBinnedPaths(_binnedPath);
+    }
+    return assets;
+  }
+
+  /// Restores items from the bin (un-marks them). Because the soft bin never
+  /// moved the files, each item simply reappears in its original album — and if
+  /// that album had become empty and disappeared, it comes back automatically.
+  /// Always succeeds.
+  Future<bool> restoreFromBin(List<AssetEntity> assets) async {
+    if (assets.isEmpty) return true;
+    for (final asset in assets) {
+      _binnedAt.remove(asset.id);
+      _binnedPath.remove(asset.id);
+    }
+    await _settings.saveBinnedAt(_binnedAt);
+    await _settings.saveBinnedPaths(_binnedPath);
+    await loadAlbums();
+    return true;
+  }
+
+  /// Permanently deletes the given items (from the bin). Returns removed ids.
+  Future<List<String>> deleteForever(List<String> ids) async {
     if (ids.isEmpty) return const [];
-    return _media.deleteAssets(ids);
+    final removed = await _media.deleteAssets(ids);
+    // Only items actually deleted leave the bin (the system delete dialog may be
+    // cancelled, in which case they stay).
+    for (final id in removed) {
+      _binnedAt.remove(id);
+      _binnedPath.remove(id);
+    }
+    await _settings.saveBinnedAt(_binnedAt);
+    await _settings.saveBinnedPaths(_binnedPath);
+    return removed;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Media stacks (group related photos under one tile)
+  // ---------------------------------------------------------------------------
+
+  void _rebuildStackIndex() {
+    _memberToStack.clear();
+    for (final stack in _stacks.values) {
+      for (final id in stack.memberIds) {
+        _memberToStack[id] = stack.id;
+      }
+    }
+  }
+
+  /// The stack an asset belongs to, or null.
+  MediaStack? stackForAsset(String id) {
+    final stackId = _memberToStack[id];
+    return stackId == null ? null : _stacks[stackId];
+  }
+
+  /// True when an asset is part of a stack.
+  bool isStacked(String id) => _memberToStack.containsKey(id);
+
+  /// True when an asset is the visible cover of its stack.
+  bool isStackCover(String id) => stackForAsset(id)?.coverId == id;
+
+  /// True when an asset is a hidden (non-cover) stack member — collapsed out of
+  /// the grid.
+  bool isHiddenStackMember(String id) {
+    final stack = stackForAsset(id);
+    return stack != null && stack.coverId != id;
+  }
+
+  void _detachFromStack(String id) {
+    final stackId = _memberToStack[id];
+    if (stackId == null) return;
+    final stack = _stacks[stackId];
+    if (stack == null) return;
+    final members = stack.memberIds.where((m) => m != id).toList();
+    if (members.length < 2) {
+      _stacks.remove(stackId); // a stack needs at least two members
+    } else {
+      final cover = stack.coverId == id ? members.first : stack.coverId;
+      _stacks[stackId] = stack.copyWith(memberIds: members, coverId: cover);
+    }
+  }
+
+  Future<void> setAutoStackByName(bool value) async {
+    _autoStackByName = value;
+    await _settings.saveAutoStackByName(value);
+    notifyListeners();
+  }
+
+  /// Grouping key derived from a filename, or null if it isn't a burst/variant.
+  ///
+  /// Pixel names like `PXL_20260526_134523420.BURST-02.original.jpg` and
+  /// `PXL_20260526_134523420.BURST-01.jpg` share the key
+  /// `pxl_20260526_134523420.burst`.
+  static String? autoStackKey(String? title) {
+    if (title == null || title.isEmpty) return null;
+    var name = title;
+    final dot = name.lastIndexOf('.');
+    if (dot > 0) name = name.substring(0, dot); // drop extension
+    final lower = name.toLowerCase();
+    const marker = '.burst';
+    final i = lower.indexOf(marker);
+    if (i < 0) return null;
+    return lower.substring(0, i + marker.length);
+  }
+
+  /// The `-NN` sequence number after BURST (lower = earlier; used to order).
+  static int _burstSeq(String? title) {
+    final m = RegExp(r'burst-(\d+)', caseSensitive: false)
+        .firstMatch(title ?? '');
+    return m != null ? (int.tryParse(m.group(1)!) ?? 9999) : 9999;
+  }
+
+  /// The default cover for a name group: the **enhanced** version (the one
+  /// without `.original`), preferring the lowest sequence number.
+  static AssetEntity _pickCover(List<AssetEntity> members) {
+    bool isOriginal(AssetEntity a) =>
+        (a.title ?? '').toLowerCase().contains('.original');
+    final enhanced = members.where((a) => !isOriginal(a)).toList();
+    final pool = enhanced.isNotEmpty ? enhanced : List.of(members);
+    pool.sort((a, b) => _burstSeq(a.title).compareTo(_burstSeq(b.title)));
+    return pool.first;
+  }
+
+  /// Auto-groups the given assets by filename (burst/original variants) into
+  /// stacks, skipping anything already stacked. Returns true if it created any.
+  /// No-op when the setting is off.
+  Future<bool> autoGroupAssets(List<AssetEntity> assets) async {
+    if (!_autoStackByName) return false;
+    final groups = <String, List<AssetEntity>>{};
+    for (final asset in assets) {
+      if (_memberToStack.containsKey(asset.id)) continue; // already grouped
+      final key = autoStackKey(asset.title);
+      if (key == null) continue;
+      (groups[key] ??= []).add(asset);
+    }
+
+    var created = false;
+    for (final entry in groups.entries) {
+      if (entry.value.length < 2) continue;
+      final cover = _pickCover(entry.value);
+      final ids = [
+        cover.id,
+        ...entry.value.where((a) => a.id != cover.id).map((a) => a.id),
+      ];
+      final stackId =
+          'stk_${DateTime.now().microsecondsSinceEpoch}_${entry.key.hashCode}';
+      _stacks[stackId] =
+          MediaStack(id: stackId, memberIds: ids, coverId: cover.id);
+      created = true;
+    }
+    if (created) {
+      _rebuildStackIndex();
+      await _settings.saveStacks(_stacks);
+      notifyListeners();
+    }
+    return created;
+  }
+
+  /// Disbands a stack so its members show individually again.
+  Future<void> ungroupStack(String stackId) async {
+    if (_stacks.remove(stackId) == null) return;
+    _rebuildStackIndex();
+    await _settings.saveStacks(_stacks);
+    notifyListeners();
+  }
+
+  /// Chooses which version of a stack the gallery shows.
+  Future<void> setStackCover(String stackId, String coverId) async {
+    final stack = _stacks[stackId];
+    if (stack == null || !stack.memberIds.contains(coverId)) return;
+    _stacks[stackId] = stack.copyWith(coverId: coverId);
+    await _settings.saveStacks(_stacks);
+    notifyListeners();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Album creation
+  // ---------------------------------------------------------------------------
+
+  /// Creates a new album from [assets] (which must be non-empty — an album can't
+  /// exist without media). Marks it as user-created so it isn't grouped under
+  /// "Others". Returns true on success.
+  Future<bool> createAlbum(String name, List<AssetEntity> assets) async {
+    if (assets.isEmpty) return false;
+    final folder = await _media.createAlbumWithAssets(name, assets);
+    if (folder == null) return false;
+    await loadAlbums();
+    final matches =
+        _albums.where((a) => a.canEdit && a.originalName == folder);
+    if (matches.isNotEmpty) {
+      final album = matches.first;
+      final current = _customizations[album.id] ?? const AlbumCustomization();
+      await _updateCustomization(album.id, current.copyWith(userCreated: true));
+    }
+    return true;
   }
 
   /// Whether the Google Photos hand-off is available (Android only).
@@ -380,6 +734,9 @@ class GalleryController extends ChangeNotifier {
   /// Opens the asset in Google Photos (or the system chooser as a fallback).
   Future<bool> openInGooglePhotos(AssetEntity asset) =>
       _intent.openInGooglePhotos(asset);
+
+  /// Launches the Google Photos app (to reach its trash). Returns true if open.
+  Future<bool> openGooglePhotosApp() => _intent.openGooglePhotosApp();
 
   /// Refreshes album counts/covers after assets were deleted in the viewer.
   void onAssetsDeleted() => loadAlbums();

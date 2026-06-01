@@ -8,9 +8,11 @@ import 'package:photo_manager/photo_manager.dart';
 import 'package:provider/provider.dart';
 
 import '../models/album.dart';
+import '../models/media_stack.dart';
 import '../state/gallery_controller.dart';
 import 'photo_view_page.dart';
 import 'widgets/asset_thumbnail.dart';
+import 'widgets/name_input_dialog.dart';
 import 'widgets/pressable.dart';
 
 /// A paginated, day-grouped grid of the photos/videos inside an [Album].
@@ -87,22 +89,33 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
   Future<void> _loadMore() async {
     if (_loading || !_hasMore) return;
     setState(() => _loading = true);
+    final controller = context.read<GalleryController>();
     final batch =
         await widget.album.path.getAssetListPaged(page: _page, size: _pageSize);
     if (!mounted) return;
+    // Binned items physically remain on disk; hide them while browsing.
+    final visible = batch.where((a) => !controller.isBinned(a.id)).toList();
     setState(() {
-      _assets.addAll(batch);
+      _assets.addAll(visible);
       _page++;
       _hasMore = batch.length == _pageSize;
       _loading = false;
     });
+    // Auto-group burst/original variants now loaded; collapse them if any.
+    final grouped = await controller.autoGroupAssets(_assets);
+    if (grouped && mounted) setState(() {});
   }
 
   // --- grouping ---
 
   List<_DaySection> get _sections {
+    final controller = context.read<GalleryController>();
     final sections = <_DaySection>[];
     for (final asset in _assets) {
+      // Non-cover members of a stack are collapsed into their cover tile —
+      // except in selection mode, where the stack expands so each version can
+      // be selected, deleted, or moved individually.
+      if (!_selecting && controller.isHiddenStackMember(asset.id)) continue;
       final d = asset.createDateTime;
       final day = DateTime(d.year, d.month, d.day);
       if (sections.isEmpty || sections.last.day != day) {
@@ -263,14 +276,57 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
   }
 
   Future<void> _openViewer(AssetEntity asset) async {
-    final index = _assets.indexWhere((a) => a.id == asset.id);
+    final controller = context.read<GalleryController>();
+    // Swipe only through visible tiles (stack covers, not hidden members).
+    final display = _assets
+        .where((a) => !controller.isHiddenStackMember(a.id))
+        .toList();
+    final index = display.indexWhere((a) => a.id == asset.id);
     if (index < 0) return;
     final deletedIds = await Navigator.of(context).push<Set<String>>(
       MaterialPageRoute(
         builder: (_) => PhotoViewPage(
-          assets: List.of(_assets),
+          assets: display,
           initialIndex: index,
           albumName: widget.album.displayName,
+        ),
+      ),
+    );
+    if (deletedIds != null && deletedIds.isNotEmpty && mounted) {
+      setState(() {
+        _assets.removeWhere((a) => deletedIds.contains(a.id));
+        _selected.removeAll(deletedIds);
+      });
+      _popIfEmpty();
+    }
+  }
+
+  /// Opens a stack's versions full-screen (cover first), where the user can
+  /// switch versions, pick the cover, or ungroup.
+  Future<void> _openStack(MediaStack stack) async {
+    final members = <AssetEntity>[];
+    for (final id in stack.memberIds) {
+      AssetEntity? asset;
+      for (final a in _assets) {
+        if (a.id == id) {
+          asset = a;
+          break;
+        }
+      }
+      asset ??= await AssetEntity.fromId(id);
+      if (asset != null) members.add(asset);
+    }
+    if (members.isEmpty || !mounted) return;
+    var coverIndex = members.indexWhere((a) => a.id == stack.coverId);
+    if (coverIndex < 0) coverIndex = 0;
+
+    final deletedIds = await Navigator.of(context).push<Set<String>>(
+      MaterialPageRoute(
+        builder: (_) => PhotoViewPage(
+          assets: members,
+          initialIndex: coverIndex,
+          albumName: '${members.length} versions',
+          stackId: stack.id,
         ),
       ),
     );
@@ -289,38 +345,60 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
     final messenger = ScaffoldMessenger.of(context);
     final count = _selected.length;
 
+    final toBin = controller.binSupported;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text('Delete $count item${count == 1 ? '' : 's'}?'),
-        content: const Text(
-            'They will be permanently removed from your device.'),
+        title: Text(toBin
+            ? 'Move $count item${count == 1 ? '' : 's'} to Bin?'
+            : 'Delete $count item${count == 1 ? '' : 's'}?'),
+        content: Text(toBin
+            ? 'You can restore them from the Bin.'
+            : 'They will be permanently removed from your device.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
             child: const Text('Cancel'),
           ),
           FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
             onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Delete'),
+            child: Text(toBin ? 'Move to Bin' : 'Delete'),
           ),
         ],
       ),
     );
     if (confirmed != true) return;
 
-    final removed = await controller.deleteAssets(_selected.toList());
-    if (removed.isNotEmpty) controller.onAssetsDeleted();
+    final assets = _assets.where((a) => _selected.contains(a.id)).toList();
+    final movedIds = assets.map((a) => a.id).toSet();
+    bool ok;
+    try {
+      ok = await controller.trashAssets(assets);
+    } catch (e) {
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text('Delete failed: $e'),
+        duration: const Duration(seconds: 6),
+      ));
+      return;
+    }
     if (!mounted) return;
+    if (!ok) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Could not delete the selected items')),
+      );
+      return;
+    }
     setState(() {
-      _assets.removeWhere((a) => removed.contains(a.id));
+      _assets.removeWhere((a) => movedIds.contains(a.id));
       _selecting = false;
       _selected.clear();
     });
     messenger.showSnackBar(
-      SnackBar(content: Text('Deleted ${removed.length} '
-          'item${removed.length == 1 ? '' : 's'}')),
+      SnackBar(content: Text(toBin
+          ? 'Moved ${movedIds.length} item${movedIds.length == 1 ? '' : 's'} to Bin'
+          : 'Deleted ${movedIds.length} '
+              'item${movedIds.length == 1 ? '' : 's'}')),
     );
     _popIfEmpty();
   }
@@ -344,10 +422,29 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
     final assets =
         _assets.where((a) => _selected.contains(a.id)).toList();
 
-    final destination = await _pickDestination(controller);
-    if (destination == null || !mounted) return;
+    // The picker returns an existing Album, or a String for a new album name.
+    final target = await _pickDestination(controller);
+    if (target == null || !mounted) return;
 
-    final ok = await controller.moveAssets(assets, destination);
+    final bool ok;
+    final String destName;
+    try {
+      if (target is Album) {
+        ok = await controller.moveAssets(assets, target);
+        destName = target.displayName;
+      } else {
+        final name = target as String;
+        ok = await controller.createAlbum(name, assets);
+        destName = name;
+      }
+    } catch (e) {
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text('Move failed: $e'),
+        duration: const Duration(seconds: 6),
+      ));
+      return;
+    }
     if (!mounted) return;
     if (!ok) {
       messenger.showSnackBar(
@@ -363,16 +460,55 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
     });
     messenger.showSnackBar(
       SnackBar(content: Text('Moved ${movedIds.length} '
-          'item${movedIds.length == 1 ? '' : 's'} to ${destination.displayName}')),
+          'item${movedIds.length == 1 ? '' : 's'} to $destName')),
     );
     _popIfEmpty();
   }
 
+  /// Creates a new album directly from the current selection.
+  Future<void> _createAlbumFromSelection() async {
+    if (_selected.isEmpty) return;
+    final controller = context.read<GalleryController>();
+    final messenger = ScaffoldMessenger.of(context);
+    final assets = _assets.where((a) => _selected.contains(a.id)).toList();
+
+    final name = await _promptAlbumName();
+    if (name == null || name.trim().isEmpty || !mounted) return;
+
+    final movedIds = assets.map((a) => a.id).toSet();
+    final ok = await controller.createAlbum(name.trim(), assets);
+    if (!mounted) return;
+    if (!ok) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Could not create the album')),
+      );
+      return;
+    }
+    setState(() {
+      _assets.removeWhere((a) => movedIds.contains(a.id));
+      _selecting = false;
+      _selected.clear();
+    });
+    messenger.showSnackBar(
+      SnackBar(content: Text('Created "${name.trim()}" with '
+          '${movedIds.length} item${movedIds.length == 1 ? '' : 's'}')),
+    );
+    _popIfEmpty();
+  }
+
+  /// Prompts for a new album name. Returns null if cancelled.
+  Future<String?> _promptAlbumName() => showNameInputDialog(
+        context,
+        title: 'New album',
+        confirmLabel: 'Create',
+      );
+
   /// Bottom-sheet picker of destination albums (excludes this album and the
-  /// locked "All Photos").
-  Future<Album?> _pickDestination(GalleryController controller) {
+  /// locked "All Photos"). Returns an [Album], or a [String] when the user
+  /// chooses to create a new album.
+  Future<Object?> _pickDestination(GalleryController controller) {
     final destinations = controller.moveDestinations(widget.album.id);
-    return showModalBottomSheet<Album>(
+    return showModalBottomSheet<Object>(
       context: context,
       isScrollControlled: true,
       builder: (sheetContext) {
@@ -389,6 +525,19 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                           fontSize: 18, fontWeight: FontWeight.w700)),
                 ),
               ),
+              ListTile(
+                leading: const Icon(Icons.create_new_folder_outlined),
+                title: const Text('Create new album'),
+                onTap: () async {
+                  final name = await _promptAlbumName();
+                  if (name != null && name.trim().isNotEmpty) {
+                    if (sheetContext.mounted) {
+                      Navigator.pop(sheetContext, name.trim());
+                    }
+                  }
+                },
+              ),
+              const Divider(height: 1),
               if (destinations.isEmpty)
                 const Padding(
                   padding: EdgeInsets.all(24),
@@ -471,9 +620,12 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
 
   List<Widget> _buildSlivers(List<_DaySection> sections, int columns) {
     final slivers = <Widget>[];
-    var offset = 0; // running index into _assets, for drag-select hit-testing
+    // True index of each asset within _assets, so drag-select stays correct
+    // regardless of whether stacks are collapsed or expanded.
+    final assetIndex = <String, int>{
+      for (var k = 0; k < _assets.length; k++) _assets[k].id: k,
+    };
     for (final section in sections) {
-      final startIndex = offset;
       slivers.add(
         SliverToBoxAdapter(
           child: _DayHeader(
@@ -497,7 +649,13 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
             delegate: SliverChildBuilderDelegate(
               (context, i) {
                 final asset = section.items[i];
-                final globalIndex = startIndex + i;
+                final globalIndex = assetIndex[asset.id] ?? 0;
+                final stack =
+                    context.read<GalleryController>().stackForAsset(asset.id);
+                final stackCount =
+                    stack != null && stack.coverId == asset.id
+                        ? stack.count
+                        : null;
                 // MetaData carries the index so a moving finger can be
                 // hit-tested to the cell underneath it during drag-select.
                 return MetaData(
@@ -507,13 +665,21 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                     asset: asset,
                     selecting: _selecting,
                     isSelected: _selected.contains(asset.id),
-                    onTap: () => _selecting
-                        ? _toggleAsset(asset)
-                        : _openViewer(asset),
+                    stackCount: stackCount,
+                    onTap: () {
+                      if (_selecting) {
+                        _toggleAsset(asset);
+                      } else if (stack != null) {
+                        _openStack(stack);
+                      } else {
+                        _openViewer(asset);
+                      }
+                    },
                     // Long-press anchors a drag-select; sliding selects more.
                     onLongPress: () => _startDragSelect(globalIndex),
                     // Preview opens full screen without changing the selection.
-                    onPreview: () => _openViewer(asset),
+                    onPreview: () =>
+                        stack != null ? _openStack(stack) : _openViewer(asset),
                   ),
                 );
               },
@@ -522,7 +688,6 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
           ),
         ),
       );
-      offset += section.items.length;
     }
     slivers.add(const SliverToBoxAdapter(child: SizedBox(height: 24)));
     return slivers;
@@ -543,6 +708,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
   }
 
   AppBar _selectionAppBar() {
+    final controller = context.read<GalleryController>();
     final count = _selected.length;
     return AppBar(
       leading: IconButton(
@@ -551,7 +717,13 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
       ),
       title: Text(count == 0 ? 'Select items' : '$count selected'),
       actions: [
-        if (context.read<GalleryController>().canMoveBetweenAlbums)
+        if (controller.binSupported)
+          IconButton(
+            tooltip: 'Create new album',
+            icon: const Icon(Icons.create_new_folder_outlined),
+            onPressed: count == 0 ? null : _createAlbumFromSelection,
+          ),
+        if (controller.canMoveBetweenAlbums)
           IconButton(
             tooltip: 'Move to album',
             icon: const Icon(Icons.drive_file_move_outline),
@@ -627,6 +799,7 @@ class _AssetCell extends StatelessWidget {
     required this.onTap,
     required this.onLongPress,
     required this.onPreview,
+    this.stackCount,
   });
 
   final AssetEntity asset;
@@ -637,6 +810,9 @@ class _AssetCell extends StatelessWidget {
 
   /// Opens the full-screen preview without affecting selection.
   final VoidCallback onPreview;
+
+  /// When non-null, this tile is a stack cover; shows a "layers ×N" badge.
+  final int? stackCount;
 
   @override
   Widget build(BuildContext context) {
@@ -651,6 +827,28 @@ class _AssetCell extends StatelessWidget {
             padding: EdgeInsets.all(isSelected ? 6 : 0),
             child: AssetThumbnail(asset: asset, size: 300),
           ),
+          if (stackCount != null && !selecting)
+            Positioned(
+              top: 4,
+              right: 4,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.layers, color: Colors.white, size: 13),
+                    const SizedBox(width: 2),
+                    Text('$stackCount',
+                        style: const TextStyle(
+                            color: Colors.white, fontSize: 11)),
+                  ],
+                ),
+              ),
+            ),
           if (selecting) ...[
             Positioned(
               top: 4,

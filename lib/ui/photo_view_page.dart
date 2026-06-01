@@ -1,5 +1,3 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:photo_manager_image_provider/photo_manager_image_provider.dart';
@@ -10,13 +8,9 @@ import 'package:provider/provider.dart';
 import '../state/gallery_controller.dart';
 import 'photo_info_sheet.dart';
 
-/// Full-screen, swipeable viewer.
-///
-/// Images support two-finger pinch-zoom and **two-finger rotation** (via
-/// photo_view's `enableRotation`) — this rotates the image itself, independent
-/// of the device's auto-rotate setting. The bottom bar exposes Info, Open in
-/// Google Photos and Delete. Videos show a play button that hands off to an
-/// external player.
+/// Full-screen, swipeable viewer with pinch-to-zoom. The bottom bar exposes
+/// Info, Open in Google Photos and Delete. Videos show a play button that hands
+/// off to an external player.
 ///
 /// Pops with the set of deleted asset ids so the caller can update its grid.
 class PhotoViewPage extends StatefulWidget {
@@ -25,11 +19,16 @@ class PhotoViewPage extends StatefulWidget {
     required this.assets,
     required this.initialIndex,
     required this.albumName,
+    this.stackId,
   });
 
   final List<AssetEntity> assets;
   final int initialIndex;
   final String albumName;
+
+  /// When set, the viewer is showing a stack's versions: it offers "Set as
+  /// cover" and "Ungroup" actions.
+  final String? stackId;
 
   @override
   State<PhotoViewPage> createState() => _PhotoViewPageState();
@@ -41,41 +40,6 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
   late int _index;
   final Set<String> _deleted = {};
   bool _chromeVisible = true;
-
-  /// One controller per item, so we can snap rotation to the nearest 90°
-  /// (horizontal/vertical) when the two-finger gesture ends — for both photos
-  /// and videos.
-  final Map<String, PhotoViewController> _controllers = {};
-
-  /// The settled quarter-turn count per item, so we only re-fit on a real
-  /// orientation change (and leave plain pinch-zoom alone).
-  final Map<String, int> _settledSteps = {};
-
-  PhotoViewController _controllerFor(String id) =>
-      _controllers.putIfAbsent(id, PhotoViewController.new);
-
-  /// Called when a two-finger gesture ends. Snaps rotation to the nearest
-  /// horizontal/vertical orientation and, when the orientation changed, scales
-  /// the item so the whole photo/video fits the screen (even if small).
-  void _onGestureEnd(String id, Size content) {
-    final controller = _controllers[id];
-    if (controller == null) return;
-    const quarter = math.pi / 2;
-    final steps = (controller.rotation / quarter).round();
-    controller.rotation = steps * quarter; // snap to horizontal / vertical
-
-    if (steps != (_settledSteps[id] ?? 0)) {
-      final swapped = steps.isOdd; // 90° / 270° → width and height swap
-      final viewport = MediaQuery.sizeOf(context);
-      final w = content.width, h = content.height;
-      final fit = swapped
-          ? math.min(viewport.width / h, viewport.height / w)
-          : math.min(viewport.width / w, viewport.height / h);
-      controller.scale = fit;
-      controller.position = Offset.zero;
-    }
-    _settledSteps[id] = steps;
-  }
 
   AssetEntity get _current => _assets[_index];
 
@@ -90,9 +54,6 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
   @override
   void dispose() {
     _pageController.dispose();
-    for (final controller in _controllers.values) {
-      controller.dispose();
-    }
     super.dispose();
   }
 
@@ -117,21 +78,22 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
     final controller = context.read<GalleryController>();
     final messenger = ScaffoldMessenger.of(context);
 
+    final toBin = controller.binSupported;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Delete this item?'),
-        content: const Text(
-            'It will be permanently removed from your device.'),
+        title: Text(toBin ? 'Move this item to Bin?' : 'Delete this item?'),
+        content: Text(toBin
+            ? 'You can restore it from the Bin.'
+            : 'It will be permanently removed from your device.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
             child: const Text('Cancel'),
           ),
           FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
             onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Delete'),
+            child: Text(toBin ? 'Move to Bin' : 'Delete'),
           ),
         ],
       ),
@@ -139,7 +101,18 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
     if (confirmed != true) return;
 
     final id = _current.id;
-    final ok = await controller.deleteAsset(id);
+    bool ok;
+    try {
+      ok = await controller.trashAssets([_current]);
+    } catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(SnackBar(
+          content: Text('Delete failed: $e'),
+          duration: const Duration(seconds: 6),
+        ));
+      }
+      return;
+    }
     if (!ok || !mounted) {
       if (mounted) {
         messenger.showSnackBar(
@@ -163,6 +136,40 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
     }
   }
 
+  List<Widget> _stackActions() {
+    return [
+      TextButton.icon(
+        onPressed: _setAsCover,
+        icon: const Icon(Icons.star_outline, color: Colors.white, size: 18),
+        label: const Text('Set as cover',
+            style: TextStyle(color: Colors.white)),
+      ),
+      PopupMenuButton<String>(
+        iconColor: Colors.white,
+        onSelected: (v) {
+          if (v == 'ungroup') _ungroup();
+        },
+        itemBuilder: (_) => [
+          const PopupMenuItem(value: 'ungroup', child: Text('Ungroup stack')),
+        ],
+      ),
+    ];
+  }
+
+  Future<void> _setAsCover() async {
+    final controller = context.read<GalleryController>();
+    final messenger = ScaffoldMessenger.of(context);
+    await controller.setStackCover(widget.stackId!, _current.id);
+    messenger.showSnackBar(
+      const SnackBar(content: Text('Stack cover updated')),
+    );
+  }
+
+  Future<void> _ungroup() async {
+    await context.read<GalleryController>().ungroupStack(widget.stackId!);
+    if (mounted) _close();
+  }
+
   @override
   Widget build(BuildContext context) {
     return PopScope(
@@ -183,9 +190,12 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
                   onPressed: _close,
                 ),
                 title: Text(
-                  '${_index + 1} / ${_assets.length}',
+                  widget.stackId != null
+                      ? 'Version ${_index + 1} / ${_assets.length}'
+                      : '${_index + 1} / ${_assets.length}',
                   style: const TextStyle(fontSize: 16),
                 ),
+                actions: widget.stackId == null ? null : _stackActions(),
               )
             : null,
         body: Stack(
@@ -196,7 +206,6 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
               onPageChanged: (i) => setState(() => _index = i),
               backgroundDecoration:
                   const BoxDecoration(color: Colors.black),
-              enableRotation: true, // two-finger rotation of the image itself
               scrollPhysics: const BouncingScrollPhysics(),
               builder: (context, index) {
                 final asset = _assets[index];
@@ -206,13 +215,8 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
                 return PhotoViewGalleryPageOptions(
                   imageProvider:
                       AssetEntityImageProvider(asset, isOriginal: true),
-                  controller: _controllerFor(asset.id),
-                  minScale: PhotoViewComputedScale.contained * 0.4,
+                  minScale: PhotoViewComputedScale.contained,
                   maxScale: PhotoViewComputedScale.covered * 4,
-                  onScaleEnd: (context, details, value) => _onGestureEnd(
-                    asset.id,
-                    Size(asset.width.toDouble(), asset.height.toDouble()),
-                  ),
                   onTapUp: (context, details, value) => _toggleChrome(),
                 );
               },
@@ -230,13 +234,8 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
   PhotoViewGalleryPageOptions _videoPage(AssetEntity asset) {
     return PhotoViewGalleryPageOptions.customChild(
       childSize: Size(asset.width.toDouble(), asset.height.toDouble()),
-      controller: _controllerFor(asset.id),
-      minScale: PhotoViewComputedScale.contained * 0.4,
+      minScale: PhotoViewComputedScale.contained,
       maxScale: PhotoViewComputedScale.covered * 2,
-      onScaleEnd: (context, details, value) => _onGestureEnd(
-        asset.id,
-        Size(asset.width.toDouble(), asset.height.toDouble()),
-      ),
       onTapUp: (context, details, value) => _toggleChrome(),
       child: GestureDetector(
         onTap: _openInGooglePhotos,

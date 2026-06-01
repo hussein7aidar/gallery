@@ -8,6 +8,36 @@ import '../models/album_stats.dart';
 /// Thin wrapper around photo_manager for permissions, album and asset loading,
 /// and deletion. Keeps all plugin-specific calls in one place.
 class MediaService {
+  /// Filter for normal browsing. When [minSizeBytes] > 0, also excludes media
+  /// smaller than that (used to hide tiny third-party junk images). The filter
+  /// is baked into each returned [AssetPathEntity], so counts and paged loads
+  /// honor it automatically.
+  PMFilter _browseFilter(int minSizeBytes) {
+    if (minSizeBytes <= 0) {
+      return FilterOptionGroup(
+        orders: [
+          const OrderOption(type: OrderOptionType.createDate, asc: false),
+        ],
+      );
+    }
+    return AdvancedCustomFilter(
+      where: [
+        ColumnWhereCondition(
+            column: 'media_type', operator: 'IN', value: '(1,3)',
+            needCheck: false),
+        ColumnWhereCondition(
+            column: '_size',
+            operator: '>=',
+            value: '$minSizeBytes',
+            needCheck: false),
+      ],
+      orderBy: [const OrderByItem('date_added', false)],
+    );
+  }
+
+  /// Builds the same browse filter for paged asset loads in album detail.
+  PMFilter browseFilter(int minSizeBytes) => _browseFilter(minSizeBytes);
+
   /// Requests media access. Returns the granted [PermissionState] so the UI can
   /// distinguish full access, limited ("selected photos") access and denial.
   Future<PermissionState> requestPermission() {
@@ -25,28 +55,83 @@ class MediaService {
   ///
   /// For each folder we also fetch the item count and the first asset to use as
   /// a cover thumbnail.
-  Future<List<Album>> loadAlbums() async {
+  /// [excludeIds] are items in the recycle bin: they're skipped for covers and
+  /// subtracted from each album's count. [binnedByFolder] maps a normalized
+  /// folder path to how many of its items are binned, so counts stay accurate
+  /// and fully-binned albums are dropped entirely.
+  Future<List<Album>> loadAlbums({
+    Set<String> excludeIds = const {},
+    Map<String, int> binnedByFolder = const {},
+    int minSizeBytes = 0,
+  }) async {
     final paths = await PhotoManager.getAssetPathList(
       type: RequestType.common, // images + videos
       hasAll: true,
-      filterOption: FilterOptionGroup(
-        orders: [
-          const OrderOption(type: OrderOptionType.createDate, asc: false),
-        ],
-      ),
+      filterOption: _browseFilter(minSizeBytes),
     );
+    final totalBinned = binnedByFolder.values.fold(0, (a, b) => a + b);
 
     final albums = <Album>[];
     for (final path in paths) {
-      final count = await path.assetCountAsync;
+      final total = await path.assetCountAsync;
+
+      // Look at the head of the folder to learn its path and pick a cover that
+      // isn't binned.
       AssetEntity? cover;
-      if (count > 0) {
-        final first = await path.getAssetListRange(start: 0, end: 1);
-        if (first.isNotEmpty) cover = first.first;
+      String? folder;
+      if (total > 0) {
+        final head = await path.getAssetListRange(
+            start: 0, end: excludeIds.isEmpty ? 1 : 24);
+        for (final asset in head) {
+          folder ??= _normalizeFolder(asset.relativePath);
+          if (!excludeIds.contains(asset.id)) {
+            cover = asset;
+            break;
+          }
+        }
       }
-      albums.add(Album(path: path, assetCount: count, coverAsset: cover));
+
+      // Subtract binned items: everything for "All Photos", per-folder otherwise.
+      final binnedHere = path.isAll
+          ? totalBinned
+          : (folder != null ? (binnedByFolder[folder] ?? 0) : 0);
+      final effective = total - binnedHere;
+
+      // A non-locked folder with nothing left is gone (its album disappears).
+      if (!path.isAll && effective <= 0) continue;
+
+      albums.add(Album(
+        path: path,
+        assetCount: effective < 0 ? 0 : effective,
+        coverAsset: cover,
+      ));
     }
     return albums;
+  }
+
+  /// Normalizes a MediaStore relative path for use as a folder key (lower-case,
+  /// no trailing slash).
+  static String _normalizeFolder(String? relativePath) {
+    var p = (relativePath ?? '').toLowerCase();
+    if (p.endsWith('/')) p = p.substring(0, p.length - 1);
+    return p;
+  }
+
+  /// Exposes the folder normalization so callers build matching keys.
+  static String normalizeFolder(String? relativePath) =>
+      _normalizeFolder(relativePath);
+
+  /// Creates a new album named [name] by moving [assets] into a new folder under
+  /// Pictures. An album can't exist without media, so [assets] must be non-empty.
+  /// Returns the sanitized folder name on success, or null on failure.
+  Future<String?> createAlbumWithAssets(
+      String name, List<AssetEntity> assets) async {
+    if (!Platform.isAndroid || assets.isEmpty) return null;
+    final safe = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '').trim();
+    if (safe.isEmpty) return null;
+    final ok = await PhotoManager.editor.android
+        .moveAssetsToPath(entities: assets, targetPath: 'Pictures/$safe');
+    return ok ? safe : null;
   }
 
   /// Loads a page of assets from an album, newest first.

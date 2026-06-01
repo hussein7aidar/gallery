@@ -9,6 +9,9 @@ import '../theme.dart';
 import 'album_actions.dart';
 import 'album_detail_page.dart';
 import 'album_stats_sheet.dart';
+import 'bin_page.dart';
+import 'others_page.dart';
+import 'settings_page.dart';
 import 'widgets/asset_thumbnail.dart';
 import 'widgets/pressable.dart';
 
@@ -78,8 +81,8 @@ class _HomePageState extends State<HomePage> {
         title: Text('Delete ${albums.length} '
             'album${albums.length == 1 ? '' : 's'}?'),
         content: Text(
-          'This permanently deletes all $totalItems photos and videos in the '
-          'selected albums from your device. This cannot be undone.',
+          'All $totalItems photos and videos in the selected albums will be '
+          'moved to the Bin. You can restore them from there.',
         ),
         actions: [
           TextButton(
@@ -143,8 +146,13 @@ class _HomePageState extends State<HomePage> {
         PopupMenuButton<String>(
           tooltip: 'More',
           onSelected: (value) {
-            if (value == 'hidden') {
-              controller.setShowHidden(!controller.showHidden);
+            switch (value) {
+              case 'hidden':
+                controller.setShowHidden(!controller.showHidden);
+              case 'settings':
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const SettingsPage()),
+                );
             }
           },
           itemBuilder: (context) => [
@@ -153,6 +161,14 @@ class _HomePageState extends State<HomePage> {
               checked: controller.showHidden,
               enabled: controller.hasHiddenAlbums || controller.showHidden,
               child: const Text('Show hidden albums'),
+            ),
+            const PopupMenuItem(
+              value: 'settings',
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(Icons.settings_outlined),
+                title: Text('Settings'),
+              ),
             ),
           ],
         ),
@@ -286,7 +302,148 @@ class _AlbumsView extends StatelessWidget {
                     onLongPress: onLongPress,
                   ),
           ),
+          // "Others" + "Bin" sit under all albums, side by side. They stay
+          // visible during selection: Others can be entered to select inside,
+          // the Bin is disabled (like "All Photos").
+          _SpecialFooter(controller: controller, selecting: selecting),
         ],
+      ),
+    );
+  }
+}
+
+/// The bottom row holding the "Others" (auto-generated albums) and "Bin" tiles.
+class _SpecialFooter extends StatelessWidget {
+  const _SpecialFooter({required this.controller, required this.selecting});
+  final GalleryController controller;
+  final bool selecting;
+
+  @override
+  Widget build(BuildContext context) {
+    final showOthers = controller.hasOthers;
+    final showBin = controller.binSupported;
+    if (!showOthers && !showBin) return const SizedBox.shrink();
+
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (showOthers)
+              Expanded(
+                child: _OthersTile(albums: controller.otherAlbums),
+              ),
+            if (showOthers && showBin) const SizedBox(width: 12),
+            if (showBin)
+              Expanded(
+                child: _BinTile(disabled: selecting),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// "Others" tile with a 2×2 collage of the first item of the first four
+/// auto-generated albums.
+class _OthersTile extends StatelessWidget {
+  const _OthersTile({required this.albums});
+  final List<Album> albums;
+
+  @override
+  Widget build(BuildContext context) {
+    final covers = albums.take(4).toList();
+    return GestureDetector(
+      onTap: () => Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const OthersPage()),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          AspectRatio(
+            aspectRatio: 1,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(AppTheme.tileRadius),
+              child: GridView.count(
+                crossAxisCount: 2,
+                physics: const NeverScrollableScrollPhysics(),
+                mainAxisSpacing: 2,
+                crossAxisSpacing: 2,
+                children: List.generate(4, (i) {
+                  final cover = i < covers.length ? covers[i].coverAsset : null;
+                  return cover == null
+                      ? ColoredBox(
+                          color: Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerHighest)
+                      : AssetThumbnail(
+                          asset: cover, size: 200, showVideoBadge: false);
+                }),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          const Text('Others',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontWeight: FontWeight.w600)),
+          Text(
+            '${albums.length} album${albums.length == 1 ? '' : 's'}',
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// "Bin" tile — opens the recycle bin.
+class _BinTile extends StatelessWidget {
+  const _BinTile({this.disabled = false});
+
+  /// Disabled during album selection (the Bin can't be selected), mirroring how
+  /// "All Photos" is locked out.
+  final bool disabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Opacity(
+      opacity: disabled ? 0.4 : 1,
+      child: GestureDetector(
+        onTap: disabled
+            ? null
+            : () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const BinPage()),
+                ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            AspectRatio(
+              aspectRatio: 1,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(AppTheme.tileRadius),
+                ),
+                child: Icon(disabled ? Icons.lock_outline : Icons.delete_outline,
+                    size: 44, color: scheme.onSurfaceVariant),
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text('Bin', style: TextStyle(fontWeight: FontWeight.w600)),
+            Text(
+              'Recently deleted',
+              style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -468,6 +625,12 @@ class _ListAlbums extends StatelessWidget {
         SliverReorderableList(
           itemCount: editable.length,
           onReorder: controller.reorderAlbums,
+          // The lifted drag item is placed in an Overlay above the Scaffold, so
+          // give it its own Material ancestor (ListTile needs one).
+          proxyDecorator: (child, index, animation) => Material(
+            type: MaterialType.transparency,
+            child: child,
+          ),
           itemBuilder: (context, index) {
             final album = editable[index];
             return _AlbumListRow(

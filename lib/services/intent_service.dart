@@ -52,4 +52,20 @@ class IntentService {
     }
     return false;
   }
+
+  /// Launches the Google Photos app (e.g. so the user can reach its trash).
+  /// Returns true if it was opened.
+  Future<bool> openGooglePhotosApp() async {
+    if (!Platform.isAndroid) return false;
+    final intent = AndroidIntent(
+      action: 'action_main',
+      package: _googlePhotosPackage,
+      category: 'android.intent.category.LAUNCHER',
+    );
+    if (await intent.canResolveActivity() ?? false) {
+      await intent.launch();
+      return true;
+    }
+    return false;
+  }
 }
