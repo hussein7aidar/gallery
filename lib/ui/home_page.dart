@@ -10,6 +10,7 @@ import 'album_actions.dart';
 import 'album_detail_page.dart';
 import 'album_stats_sheet.dart';
 import 'widgets/asset_thumbnail.dart';
+import 'widgets/pressable.dart';
 
 /// The albums screen — the home of the gallery.
 class HomePage extends StatefulWidget {
@@ -26,8 +27,6 @@ class _HomePageState extends State<HomePage> {
   /// Ids of selected albums (never contains the locked album).
   final Set<String> _selected = {};
 
-  void _enterSelection() => setState(() => _selecting = true);
-
   void _exitSelection() => setState(() {
         _selecting = false;
         _selected.clear();
@@ -40,13 +39,30 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  /// Long-pressing an album turns on multi-select and selects it. (The locked
+  /// "All Photos" album can't be selected, so it's a no-op there.)
+  void _onAlbumLongPress(Album album) {
+    if (!album.canEdit) return;
+    HapticFeedback.mediumImpact();
+    setState(() {
+      _selecting = true;
+      _selected.add(album.id);
+    });
+  }
+
+  Future<void> _renameSelected(GalleryController c) async {
+    final albums = _selectedAlbums(c);
+    if (albums.length != 1) return;
+    await showRenameDialog(context, albums.first);
+  }
+
   List<Album> _selectedAlbums(GalleryController c) =>
       c.visibleAlbums.where((a) => a.canEdit && _selected.contains(a.id)).toList();
 
-  Future<void> _hideSelected(GalleryController c) async {
+  Future<void> _setSelectedHidden(GalleryController c, bool hidden) async {
     final albums = _selectedAlbums(c);
     if (albums.isEmpty) return;
-    await c.setAlbumsHidden(albums, true);
+    await c.setAlbumsHidden(albums, hidden);
     _exitSelection();
   }
 
@@ -59,7 +75,6 @@ class _HomePageState extends State<HomePage> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        icon: const Icon(Icons.warning_amber_rounded, color: Colors.red),
         title: Text('Delete ${albums.length} '
             'album${albums.length == 1 ? '' : 's'}?'),
         content: Text(
@@ -104,6 +119,7 @@ class _HomePageState extends State<HomePage> {
             selecting: _selecting,
             selected: _selected,
             onToggle: _toggle,
+            onLongPress: _onAlbumLongPress,
           ),
         );
       },
@@ -127,22 +143,11 @@ class _HomePageState extends State<HomePage> {
         PopupMenuButton<String>(
           tooltip: 'More',
           onSelected: (value) {
-            switch (value) {
-              case 'select':
-                _enterSelection();
-              case 'hidden':
-                controller.setShowHidden(!controller.showHidden);
+            if (value == 'hidden') {
+              controller.setShowHidden(!controller.showHidden);
             }
           },
           itemBuilder: (context) => [
-            const PopupMenuItem(
-              value: 'select',
-              child: ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(Icons.checklist_rounded),
-                title: Text('Select albums'),
-              ),
-            ),
             CheckedPopupMenuItem(
               value: 'hidden',
               checked: controller.showHidden,
@@ -157,6 +162,10 @@ class _HomePageState extends State<HomePage> {
 
   AppBar _selectionAppBar(GalleryController controller) {
     final count = _selected.length;
+    final selectedAlbums = _selectedAlbums(controller);
+    // When every selected album is already hidden, the action unhides instead.
+    final allHidden =
+        selectedAlbums.isNotEmpty && selectedAlbums.every((a) => a.hidden);
     return AppBar(
       leading: IconButton(
         icon: const Icon(Icons.close),
@@ -172,9 +181,19 @@ class _HomePageState extends State<HomePage> {
               : () => showAlbumStats(context, _selectedAlbums(controller)),
         ),
         IconButton(
-          tooltip: 'Hide',
-          icon: const Icon(Icons.visibility_off_outlined),
-          onPressed: count == 0 ? null : () => _hideSelected(controller),
+          tooltip: 'Rename',
+          icon: const Icon(Icons.drive_file_rename_outline),
+          // Renaming only makes sense for a single album.
+          onPressed: count == 1 ? () => _renameSelected(controller) : null,
+        ),
+        IconButton(
+          tooltip: allHidden ? 'Unhide' : 'Hide',
+          icon: Icon(allHidden
+              ? Icons.visibility_outlined
+              : Icons.visibility_off_outlined),
+          onPressed: count == 0
+              ? null
+              : () => _setSelectedHidden(controller, !allHidden),
         ),
         IconButton(
           tooltip: 'Delete',
@@ -192,12 +211,14 @@ class _Body extends StatelessWidget {
     required this.selecting,
     required this.selected,
     required this.onToggle,
+    required this.onLongPress,
   });
 
   final GalleryController controller;
   final bool selecting;
   final Set<String> selected;
   final void Function(Album) onToggle;
+  final void Function(Album) onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -215,6 +236,7 @@ class _Body extends StatelessWidget {
           selecting: selecting,
           selected: selected,
           onToggle: onToggle,
+          onLongPress: onLongPress,
         );
     }
   }
@@ -226,12 +248,14 @@ class _AlbumsView extends StatelessWidget {
     required this.selecting,
     required this.selected,
     required this.onToggle,
+    required this.onLongPress,
   });
 
   final GalleryController controller;
   final bool selecting;
   final Set<String> selected;
   final void Function(Album) onToggle;
+  final void Function(Album) onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -251,6 +275,7 @@ class _AlbumsView extends StatelessWidget {
                     selecting: selecting,
                     selected: selected,
                     onToggle: onToggle,
+                    onLongPress: onLongPress,
                   )
                 : _ListAlbums(
                     locked: locked,
@@ -258,6 +283,7 @@ class _AlbumsView extends StatelessWidget {
                     selecting: selecting,
                     selected: selected,
                     onToggle: onToggle,
+                    onLongPress: onLongPress,
                   ),
           ),
         ],
@@ -276,12 +302,14 @@ class _GridAlbums extends StatelessWidget {
     required this.selecting,
     required this.selected,
     required this.onToggle,
+    required this.onLongPress,
   });
 
   final List<Album> albums;
   final bool selecting;
   final Set<String> selected;
   final void Function(Album) onToggle;
+  final void Function(Album) onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -304,6 +332,7 @@ class _GridAlbums extends StatelessWidget {
           selecting: selecting,
           isSelected: selected.contains(album.id),
           onToggle: onToggle,
+          onLongPress: onLongPress,
         );
       },
     );
@@ -316,18 +345,20 @@ class _AlbumGridCell extends StatelessWidget {
     required this.selecting,
     required this.isSelected,
     required this.onToggle,
+    required this.onLongPress,
   });
 
   final Album album;
   final bool selecting;
   final bool isSelected;
   final void Function(Album) onToggle;
+  final void Function(Album) onLongPress;
 
   @override
   Widget build(BuildContext context) {
     final disabled = selecting && !album.canEdit;
 
-    return GestureDetector(
+    return Pressable(
       onTap: () {
         if (selecting) {
           onToggle(album);
@@ -335,12 +366,8 @@ class _AlbumGridCell extends StatelessWidget {
           _openAlbum(context, album);
         }
       },
-      onLongPress: (!selecting && album.canEdit)
-          ? () {
-              HapticFeedback.mediumImpact();
-              showAlbumActions(context, album);
-            }
-          : null,
+      onLongPress:
+          (!selecting && album.canEdit) ? () => onLongPress(album) : null,
       child: Opacity(
         opacity: disabled ? 0.4 : 1,
         child: Column(
@@ -410,6 +437,7 @@ class _ListAlbums extends StatelessWidget {
     required this.selecting,
     required this.selected,
     required this.onToggle,
+    required this.onLongPress,
   });
 
   final List<Album> locked;
@@ -417,6 +445,7 @@ class _ListAlbums extends StatelessWidget {
   final bool selecting;
   final Set<String> selected;
   final void Function(Album) onToggle;
+  final void Function(Album) onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -432,6 +461,7 @@ class _ListAlbums extends StatelessWidget {
                 selecting: selecting,
                 isSelected: false,
                 onToggle: onToggle,
+                onLongPress: onLongPress,
               ),
           ],
         ),
@@ -446,6 +476,7 @@ class _ListAlbums extends StatelessWidget {
               selecting: selecting,
               isSelected: selected.contains(album.id),
               onToggle: onToggle,
+              onLongPress: onLongPress,
               reorderIndex: selecting ? null : index,
             );
           },
@@ -463,6 +494,7 @@ class _AlbumListRow extends StatelessWidget {
     required this.selecting,
     required this.isSelected,
     required this.onToggle,
+    required this.onLongPress,
     this.reorderIndex,
   });
 
@@ -470,6 +502,7 @@ class _AlbumListRow extends StatelessWidget {
   final bool selecting;
   final bool isSelected;
   final void Function(Album) onToggle;
+  final void Function(Album) onLongPress;
   final int? reorderIndex;
 
   @override
@@ -499,23 +532,21 @@ class _AlbumListRow extends StatelessWidget {
       trailing = const Icon(Icons.chevron_right);
     }
 
-    return Opacity(
-      opacity: disabled ? 0.4 : 1,
-      child: ListTile(
-        onTap: () {
-          if (selecting) {
-            onToggle(album);
-          } else {
-            _openAlbum(context, album);
-          }
-        },
-        onLongPress: (!selecting && album.canEdit)
-            ? () {
-                HapticFeedback.mediumImpact();
-                showAlbumActions(context, album);
-              }
-            : null,
-        leading: ClipRRect(
+    return Pressable(
+      pressedScale: 0.97,
+      onTap: () {
+        if (selecting) {
+          onToggle(album);
+        } else {
+          _openAlbum(context, album);
+        }
+      },
+      onLongPress:
+          (!selecting && album.canEdit) ? () => onLongPress(album) : null,
+      child: Opacity(
+        opacity: disabled ? 0.4 : 1,
+        child: ListTile(
+          leading: ClipRRect(
           borderRadius: BorderRadius.circular(12),
           child: SizedBox(
             width: 56,
@@ -547,6 +578,7 @@ class _AlbumListRow extends StatelessWidget {
         ),
         subtitle: Text(subtitle),
         trailing: trailing,
+        ),
       ),
     );
   }

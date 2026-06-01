@@ -101,12 +101,40 @@ class GalleryController extends ChangeNotifier {
                   customization:
                       _customizations[a.id] ?? const AlbumCustomization()))
           .toList();
+      // Albums that became empty (e.g. all media deleted or moved out) are no
+      // longer returned by the device, so drop their stale customization and
+      // ordering entries. Skip this in "limited" mode, where many albums are
+      // intentionally absent and pruning would lose the user's settings.
+      if (permission == PermissionState.authorized) {
+        await _pruneOrphans();
+      }
       _status = GalleryStatus.ready;
     } catch (e) {
       _errorMessage = e.toString();
       _status = GalleryStatus.error;
     }
     notifyListeners();
+  }
+
+  /// Drops customizations and manual-order entries for albums that no longer
+  /// exist (e.g. became empty). Persists only if something actually changed.
+  Future<void> _pruneOrphans() async {
+    final existing = _albums.map((a) => a.id).toSet();
+    final removedCustom =
+        _customizations.keys.where((id) => !existing.contains(id)).toList();
+    final orderHadOrphan =
+        _manualOrder.any((id) => !existing.contains(id));
+
+    if (removedCustom.isNotEmpty) {
+      for (final id in removedCustom) {
+        _customizations.remove(id);
+      }
+      await _settings.saveCustomizations(_customizations);
+    }
+    if (orderHadOrphan) {
+      _manualOrder.removeWhere((id) => !existing.contains(id));
+      await _settings.saveOrder(_manualOrder);
+    }
   }
 
   Future<void> openSettings() => _media.openSettings();
@@ -251,6 +279,28 @@ class GalleryController extends ChangeNotifier {
   Future<AlbumStats> computeAlbumStats(List<Album> albums) =>
       _media.computeStats(albums);
 
+  /// Whether moving media between albums is supported (Android only).
+  bool get canMoveBetweenAlbums => _media.canMoveBetweenAlbums;
+
+  /// Editable albums that media can be moved into, excluding the source album
+  /// (by [excludeId]) and the locked "All Photos". Sorted by name.
+  List<Album> moveDestinations(String excludeId) {
+    final list = _albums
+        .where((a) => a.canEdit && a.id != excludeId)
+        .toList()
+      ..sort((a, b) =>
+          a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()));
+    return list;
+  }
+
+  /// Moves the given assets into [destination], then refreshes the album list.
+  Future<bool> moveAssets(
+      List<AssetEntity> assets, Album destination) async {
+    final ok = await _media.moveAssetsToAlbum(assets, destination);
+    if (ok) await loadAlbums();
+    return ok;
+  }
+
   /// Deletes several albums (and all their assets) at once. Locked albums are
   /// ignored. Returns the total number of assets removed.
   Future<int> deleteAlbums(Iterable<Album> albums) async {
@@ -323,6 +373,9 @@ class GalleryController extends ChangeNotifier {
     if (ids.isEmpty) return const [];
     return _media.deleteAssets(ids);
   }
+
+  /// Whether the Google Photos hand-off is available (Android only).
+  bool get canOpenInGooglePhotos => _intent.isSupported;
 
   /// Opens the asset in Google Photos (or the system chooser as a fallback).
   Future<bool> openInGooglePhotos(AssetEntity asset) =>

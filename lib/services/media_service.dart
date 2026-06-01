@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:photo_manager/photo_manager.dart';
 
 import '../models/album.dart';
@@ -60,6 +62,37 @@ class MediaService {
   /// its own confirmation dialog. Returns the ids that were actually removed.
   Future<List<String>> deleteAssets(List<String> ids) {
     return PhotoManager.editor.deleteWithIds(ids);
+  }
+
+  /// Whether moving assets between albums is supported on this platform.
+  /// Implemented with the Android MediaStore editor only.
+  bool get canMoveBetweenAlbums => Platform.isAndroid;
+
+  /// Moves [assets] into the [destination] album (device folder). On Android 11+
+  /// the system shows a single permission dialog for the batch. Returns true on
+  /// success.
+  Future<bool> moveAssetsToAlbum(
+      List<AssetEntity> assets, Album destination) async {
+    if (!Platform.isAndroid || assets.isEmpty) return false;
+
+    // Prefer the batch API (one permission dialog). It needs the destination's
+    // MediaStore RELATIVE_PATH, which we read from the album's cover asset.
+    final relative = destination.coverAsset?.relativePath;
+    if (relative != null && relative.isNotEmpty) {
+      final target =
+          relative.endsWith('/') ? relative.substring(0, relative.length - 1) : relative;
+      return PhotoManager.editor.android
+          .moveAssetsToPath(entities: assets, targetPath: target);
+    }
+
+    // Fallback: move one by one to the target path entity.
+    var allOk = true;
+    for (final asset in assets) {
+      final ok = await PhotoManager.editor.android
+          .moveAssetToAnother(entity: asset, target: destination.path);
+      allOk = allOk && ok;
+    }
+    return allOk;
   }
 
   /// Loads every asset in a folder by paging through it.

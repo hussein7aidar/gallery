@@ -70,11 +70,15 @@ dev_dependencies:
 # background matching the artwork.
 flutter_launcher_icons:
   android: "ic_launcher"
-  ios: false
+  ios: true
   image_path: "gallery.png"
   min_sdk_android: 23
   adaptive_icon_background: "#8B5CF6"
   adaptive_icon_foreground: "gallery.png"
+  # iOS app icons can't have an alpha channel; flatten transparency onto the
+  # artwork's purple so the (system-masked) corners match.
+  remove_alpha_ios: true
+  background_color_ios: "#8B5CF6"
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

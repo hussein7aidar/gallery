@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:android_intent_plus/android_intent.dart';
 import 'package:android_intent_plus/flag.dart';
 import 'package:photo_manager/photo_manager.dart';
@@ -6,11 +8,18 @@ import 'package:photo_manager/photo_manager.dart';
 class IntentService {
   static const _googlePhotosPackage = 'com.google.android.apps.photos';
 
+  /// Whether the Google Photos hand-off is available on this platform. It uses
+  /// an Android intent, so it only works on Android.
+  bool get isSupported => Platform.isAndroid;
+
   /// Opens [asset] in Google Photos. Falls back to the system chooser when
   /// Google Photos isn't installed or can't handle the item.
   ///
-  /// Returns true if an activity was launched.
+  /// Returns true if an activity was launched. Always false on non-Android
+  /// platforms (the Android intent plugin isn't available there).
   Future<bool> openInGooglePhotos(AssetEntity asset) async {
+    if (!Platform.isAndroid) return false;
+
     final uri = await asset.getMediaUrl();
     if (uri == null) return false;
 

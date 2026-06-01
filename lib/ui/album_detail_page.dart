@@ -1,4 +1,7 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:photo_manager/photo_manager.dart';
@@ -8,6 +11,7 @@ import '../models/album.dart';
 import '../state/gallery_controller.dart';
 import 'photo_view_page.dart';
 import 'widgets/asset_thumbnail.dart';
+import 'widgets/pressable.dart';
 
 /// A paginated, day-grouped grid of the photos/videos inside an [Album].
 ///
@@ -41,6 +45,25 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
 
   bool _selecting = false;
   final Set<String> _selected = {};
+
+  // --- drag-to-select state ---
+  /// True while a long-press-and-drag selection is in progress.
+  bool _dragSelecting = false;
+
+  /// Index in [_assets] where the current drag began.
+  int? _dragAnchorIndex;
+
+  /// Last cell index the finger was over, to avoid redundant rebuilds.
+  int? _dragLastIndex;
+
+  /// Whether the drag adds (true) or removes (false) items from the selection.
+  bool _dragSelectValue = true;
+
+  /// Selection snapshot at drag start, so dragging back unselects correctly.
+  Set<String> _dragBaseSelection = {};
+
+  /// Wraps the scrollable so we can hit-test cells under the moving finger.
+  final GlobalKey _gridKey = GlobalKey();
 
   @override
   void initState() {
@@ -116,6 +139,33 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
     });
   }
 
+  /// Confirms before throwing away an in-progress selection.
+  Future<void> _confirmExitSelection() async {
+    if (_selected.isEmpty) {
+      _exitSelection();
+      return;
+    }
+    final discard = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Cancel selection?'),
+        content: Text('You\'ll lose the ${_selected.length} '
+            'item${_selected.length == 1 ? '' : 's'} you selected.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Keep selecting'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Discard'),
+          ),
+        ],
+      ),
+    );
+    if (discard == true) _exitSelection();
+  }
+
   void _toggleAsset(AssetEntity asset) {
     setState(() {
       if (!_selected.remove(asset.id)) _selected.add(asset.id);
@@ -138,6 +188,80 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
     });
   }
 
+  // --- drag-to-select (long-press a thumbnail, then slide) ---
+
+  /// Starts a drag selection anchored on the long-pressed cell. Turns on
+  /// selection mode if needed. If the anchor was already selected, the drag
+  /// removes items instead of adding them.
+  void _startDragSelect(int index) {
+    HapticFeedback.mediumImpact();
+    setState(() {
+      _selecting = true;
+      _dragSelecting = true;
+      _dragAnchorIndex = index;
+      _dragLastIndex = index;
+      _dragBaseSelection = {..._selected};
+      _dragSelectValue = !_selected.contains(_assets[index].id);
+      _applyDragRange(index);
+    });
+  }
+
+  /// Re-applies the selection for the inclusive range between the anchor and
+  /// [current], starting from the snapshot taken at drag start.
+  void _applyDragRange(int current) {
+    final anchor = _dragAnchorIndex;
+    if (anchor == null) return;
+    final lo = math.min(anchor, current);
+    final hi = math.max(anchor, current);
+    final next = {..._dragBaseSelection};
+    for (var i = lo; i <= hi && i < _assets.length; i++) {
+      final id = _assets[i].id;
+      if (_dragSelectValue) {
+        next.add(id);
+      } else {
+        next.remove(id);
+      }
+    }
+    _selected
+      ..clear()
+      ..addAll(next);
+  }
+
+  void _onPointerMove(PointerMoveEvent event) {
+    if (!_dragSelecting) return;
+    final index = _cellIndexAt(event.position);
+    if (index == null || index == _dragLastIndex) return;
+    setState(() {
+      _dragLastIndex = index;
+      _applyDragRange(index);
+    });
+  }
+
+  void _endDragSelect() {
+    if (!_dragSelecting) return;
+    setState(() {
+      _dragSelecting = false;
+      _dragAnchorIndex = null;
+      _dragLastIndex = null;
+    });
+  }
+
+  /// Hit-tests the grid at a global position and returns the [_assets] index of
+  /// the cell under it (cells carry their index via a [MetaData] widget).
+  int? _cellIndexAt(Offset globalPosition) {
+    final box = _gridKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return null;
+    final result = BoxHitTestResult();
+    box.hitTest(result, position: box.globalToLocal(globalPosition));
+    for (final entry in result.path) {
+      final target = entry.target;
+      if (target is RenderMetaData && target.metaData is int) {
+        return target.metaData as int;
+      }
+    }
+    return null;
+  }
+
   Future<void> _openViewer(AssetEntity asset) async {
     final index = _assets.indexWhere((a) => a.id == asset.id);
     if (index < 0) return;
@@ -155,6 +279,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
         _assets.removeWhere((a) => deletedIds.contains(a.id));
         _selected.removeAll(deletedIds);
       });
+      _popIfEmpty();
     }
   }
 
@@ -167,7 +292,6 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        icon: const Icon(Icons.delete_outline, color: Colors.red),
         title: Text('Delete $count item${count == 1 ? '' : 's'}?'),
         content: const Text(
             'They will be permanently removed from your device.'),
@@ -198,6 +322,114 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
       SnackBar(content: Text('Deleted ${removed.length} '
           'item${removed.length == 1 ? '' : 's'}')),
     );
+    _popIfEmpty();
+  }
+
+  /// Leaves the album once it has no media left (it no longer exists on the
+  /// device, so there's nothing to show). If more pages remain, loads the next
+  /// one instead so the grid doesn't look empty prematurely.
+  void _popIfEmpty() {
+    if (_assets.isNotEmpty) return;
+    if (_hasMore) {
+      _loadMore();
+    } else if (mounted) {
+      Navigator.of(context).pop();
+    }
+  }
+
+  Future<void> _moveSelected() async {
+    if (_selected.isEmpty) return;
+    final controller = context.read<GalleryController>();
+    final messenger = ScaffoldMessenger.of(context);
+    final assets =
+        _assets.where((a) => _selected.contains(a.id)).toList();
+
+    final destination = await _pickDestination(controller);
+    if (destination == null || !mounted) return;
+
+    final ok = await controller.moveAssets(assets, destination);
+    if (!mounted) return;
+    if (!ok) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Could not move the selected items')),
+      );
+      return;
+    }
+    final movedIds = assets.map((a) => a.id).toSet();
+    setState(() {
+      _assets.removeWhere((a) => movedIds.contains(a.id));
+      _selecting = false;
+      _selected.clear();
+    });
+    messenger.showSnackBar(
+      SnackBar(content: Text('Moved ${movedIds.length} '
+          'item${movedIds.length == 1 ? '' : 's'} to ${destination.displayName}')),
+    );
+    _popIfEmpty();
+  }
+
+  /// Bottom-sheet picker of destination albums (excludes this album and the
+  /// locked "All Photos").
+  Future<Album?> _pickDestination(GalleryController controller) {
+    final destinations = controller.moveDestinations(widget.album.id);
+    return showModalBottomSheet<Album>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Padding(
+                padding: EdgeInsets.fromLTRB(16, 8, 16, 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text('Move to album',
+                      style: TextStyle(
+                          fontSize: 18, fontWeight: FontWeight.w700)),
+                ),
+              ),
+              if (destinations.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Text('No other albums to move into.'),
+                )
+              else
+                Flexible(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: destinations.length,
+                    itemBuilder: (context, i) {
+                      final album = destinations[i];
+                      return ListTile(
+                        leading: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: SizedBox(
+                            width: 48,
+                            height: 48,
+                            child: album.coverAsset == null
+                                ? const ColoredBox(color: Colors.black12)
+                                : AssetThumbnail(
+                                    asset: album.coverAsset!,
+                                    size: 200,
+                                    showVideoBadge: false,
+                                  ),
+                          ),
+                        ),
+                        title: Text(album.displayName,
+                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                        subtitle: Text('${album.assetCount} '
+                            'item${album.assetCount == 1 ? '' : 's'}'),
+                        onTap: () => Navigator.pop(sheetContext, album),
+                      );
+                    },
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   @override
@@ -206,64 +438,94 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
     final columns = (width ~/ 120).clamp(3, 6);
     final sections = _sections;
 
-    return Scaffold(
-      appBar: _selecting ? _selectionAppBar() : _normalAppBar(),
-      body: _assets.isEmpty && !_loading
-          ? const Center(child: Text('This album is empty'))
-          : CustomScrollView(
-              controller: _scroll,
-              slivers: [
-                for (final section in sections) ...[
-                  SliverToBoxAdapter(
-                    child: _DayHeader(
-                      label: _dayLabel(section.day),
-                      count: section.items.length,
-                      selecting: _selecting,
-                      selected: _dayFullySelected(section),
-                      onToggleDay: () => _toggleDay(section),
-                    ),
+    return PopScope(
+      // While selecting, the back gesture cancels the selection (with a
+      // confirmation) instead of leaving the album.
+      canPop: !_selecting,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _confirmExitSelection();
+      },
+      child: Scaffold(
+        appBar: _selecting ? _selectionAppBar() : _normalAppBar(),
+        body: _assets.isEmpty && !_loading
+            ? const Center(child: Text('This album is empty'))
+            : Listener(
+                onPointerMove: _onPointerMove,
+                onPointerUp: (_) => _endDragSelect(),
+                onPointerCancel: (_) => _endDragSelect(),
+                child: KeyedSubtree(
+                  key: _gridKey,
+                  child: CustomScrollView(
+                    controller: _scroll,
+                    // Freeze scrolling while a drag-selection is in progress.
+                    physics: _dragSelecting
+                        ? const NeverScrollableScrollPhysics()
+                        : null,
+                    slivers: _buildSlivers(sections, columns),
                   ),
-                  SliverPadding(
-                    padding: const EdgeInsets.symmetric(horizontal: 2),
-                    sliver: SliverGrid(
-                      gridDelegate:
-                          SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: columns,
-                        crossAxisSpacing: 2,
-                        mainAxisSpacing: 2,
-                      ),
-                      delegate: SliverChildBuilderDelegate(
-                        (context, i) {
-                          final asset = section.items[i];
-                          return _AssetCell(
-                            asset: asset,
-                            selecting: _selecting,
-                            isSelected: _selected.contains(asset.id),
-                            onTap: () => _selecting
-                                ? _toggleAsset(asset)
-                                : _openViewer(asset),
-                            onLongPress: () {
-                              HapticFeedback.mediumImpact();
-                              if (_selecting) {
-                                _toggleAsset(asset);
-                              } else {
-                                _enterSelection(asset);
-                              }
-                            },
-                            // Preview opens full screen without changing the
-                            // current selection.
-                            onPreview: () => _openViewer(asset),
-                          );
-                        },
-                        childCount: section.items.length,
-                      ),
-                    ),
-                  ),
-                ],
-                const SliverToBoxAdapter(child: SizedBox(height: 24)),
-              ],
-            ),
+                ),
+              ),
+      ),
     );
+  }
+
+  List<Widget> _buildSlivers(List<_DaySection> sections, int columns) {
+    final slivers = <Widget>[];
+    var offset = 0; // running index into _assets, for drag-select hit-testing
+    for (final section in sections) {
+      final startIndex = offset;
+      slivers.add(
+        SliverToBoxAdapter(
+          child: _DayHeader(
+            label: _dayLabel(section.day),
+            count: section.items.length,
+            selecting: _selecting,
+            selected: _dayFullySelected(section),
+            onToggleDay: () => _toggleDay(section),
+          ),
+        ),
+      );
+      slivers.add(
+        SliverPadding(
+          padding: const EdgeInsets.symmetric(horizontal: 2),
+          sliver: SliverGrid(
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: columns,
+              crossAxisSpacing: 2,
+              mainAxisSpacing: 2,
+            ),
+            delegate: SliverChildBuilderDelegate(
+              (context, i) {
+                final asset = section.items[i];
+                final globalIndex = startIndex + i;
+                // MetaData carries the index so a moving finger can be
+                // hit-tested to the cell underneath it during drag-select.
+                return MetaData(
+                  metaData: globalIndex,
+                  behavior: HitTestBehavior.opaque,
+                  child: _AssetCell(
+                    asset: asset,
+                    selecting: _selecting,
+                    isSelected: _selected.contains(asset.id),
+                    onTap: () => _selecting
+                        ? _toggleAsset(asset)
+                        : _openViewer(asset),
+                    // Long-press anchors a drag-select; sliding selects more.
+                    onLongPress: () => _startDragSelect(globalIndex),
+                    // Preview opens full screen without changing the selection.
+                    onPreview: () => _openViewer(asset),
+                  ),
+                );
+              },
+              childCount: section.items.length,
+            ),
+          ),
+        ),
+      );
+      offset += section.items.length;
+    }
+    slivers.add(const SliverToBoxAdapter(child: SizedBox(height: 24)));
+    return slivers;
   }
 
   AppBar _normalAppBar() {
@@ -285,10 +547,16 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
     return AppBar(
       leading: IconButton(
         icon: const Icon(Icons.close),
-        onPressed: _exitSelection,
+        onPressed: _confirmExitSelection,
       ),
       title: Text(count == 0 ? 'Select items' : '$count selected'),
       actions: [
+        if (context.read<GalleryController>().canMoveBetweenAlbums)
+          IconButton(
+            tooltip: 'Move to album',
+            icon: const Icon(Icons.drive_file_move_outline),
+            onPressed: count == 0 ? null : _moveSelected,
+          ),
         IconButton(
           tooltip: 'Delete',
           icon: const Icon(Icons.delete_outline),
@@ -373,7 +641,7 @@ class _AssetCell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return GestureDetector(
+    return Pressable(
       onTap: onTap,
       onLongPress: onLongPress,
       child: Stack(

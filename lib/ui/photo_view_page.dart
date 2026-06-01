@@ -42,19 +42,39 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
   final Set<String> _deleted = {};
   bool _chromeVisible = true;
 
-  /// One rotation/scale controller per image, so we can snap rotation to the
-  /// nearest 90° (horizontal/vertical) when the two-finger gesture ends.
-  final Map<String, PhotoViewController> _rotationControllers = {};
+  /// One controller per item, so we can snap rotation to the nearest 90°
+  /// (horizontal/vertical) when the two-finger gesture ends — for both photos
+  /// and videos.
+  final Map<String, PhotoViewController> _controllers = {};
+
+  /// The settled quarter-turn count per item, so we only re-fit on a real
+  /// orientation change (and leave plain pinch-zoom alone).
+  final Map<String, int> _settledSteps = {};
 
   PhotoViewController _controllerFor(String id) =>
-      _rotationControllers.putIfAbsent(id, PhotoViewController.new);
+      _controllers.putIfAbsent(id, PhotoViewController.new);
 
-  void _snapRotation(String id) {
-    final controller = _rotationControllers[id];
+  /// Called when a two-finger gesture ends. Snaps rotation to the nearest
+  /// horizontal/vertical orientation and, when the orientation changed, scales
+  /// the item so the whole photo/video fits the screen (even if small).
+  void _onGestureEnd(String id, Size content) {
+    final controller = _controllers[id];
     if (controller == null) return;
     const quarter = math.pi / 2;
-    final snapped = (controller.rotation / quarter).roundToDouble() * quarter;
-    if (snapped != controller.rotation) controller.rotation = snapped;
+    final steps = (controller.rotation / quarter).round();
+    controller.rotation = steps * quarter; // snap to horizontal / vertical
+
+    if (steps != (_settledSteps[id] ?? 0)) {
+      final swapped = steps.isOdd; // 90° / 270° → width and height swap
+      final viewport = MediaQuery.sizeOf(context);
+      final w = content.width, h = content.height;
+      final fit = swapped
+          ? math.min(viewport.width / h, viewport.height / w)
+          : math.min(viewport.width / w, viewport.height / h);
+      controller.scale = fit;
+      controller.position = Offset.zero;
+    }
+    _settledSteps[id] = steps;
   }
 
   AssetEntity get _current => _assets[_index];
@@ -70,7 +90,7 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
   @override
   void dispose() {
     _pageController.dispose();
-    for (final controller in _rotationControllers.values) {
+    for (final controller in _controllers.values) {
       controller.dispose();
     }
     super.dispose();
@@ -100,7 +120,6 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        icon: const Icon(Icons.delete_outline, color: Colors.red),
         title: const Text('Delete this item?'),
         content: const Text(
             'It will be permanently removed from your device.'),
@@ -188,10 +207,12 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
                   imageProvider:
                       AssetEntityImageProvider(asset, isOriginal: true),
                   controller: _controllerFor(asset.id),
-                  minScale: PhotoViewComputedScale.contained,
+                  minScale: PhotoViewComputedScale.contained * 0.4,
                   maxScale: PhotoViewComputedScale.covered * 4,
-                  onScaleEnd: (context, details, value) =>
-                      _snapRotation(asset.id),
+                  onScaleEnd: (context, details, value) => _onGestureEnd(
+                    asset.id,
+                    Size(asset.width.toDouble(), asset.height.toDouble()),
+                  ),
                   onTapUp: (context, details, value) => _toggleChrome(),
                 );
               },
@@ -200,7 +221,6 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
               ),
             ),
             if (_chromeVisible) _bottomBar(),
-            if (_chromeVisible) _rotateHint(),
           ],
         ),
       ),
@@ -210,8 +230,13 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
   PhotoViewGalleryPageOptions _videoPage(AssetEntity asset) {
     return PhotoViewGalleryPageOptions.customChild(
       childSize: Size(asset.width.toDouble(), asset.height.toDouble()),
-      minScale: PhotoViewComputedScale.contained,
+      controller: _controllerFor(asset.id),
+      minScale: PhotoViewComputedScale.contained * 0.4,
       maxScale: PhotoViewComputedScale.covered * 2,
+      onScaleEnd: (context, details, value) => _onGestureEnd(
+        asset.id,
+        Size(asset.width.toDouble(), asset.height.toDouble()),
+      ),
       onTapUp: (context, details, value) => _toggleChrome(),
       child: GestureDetector(
         onTap: _openInGooglePhotos,
@@ -234,32 +259,10 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
     );
   }
 
-  Widget _rotateHint() {
-    if (_current.type == AssetType.video) return const SizedBox.shrink();
-    return Positioned(
-      top: kToolbarHeight + 32,
-      left: 0,
-      right: 0,
-      child: IgnorePointer(
-        child: Center(
-          child: Container(
-            padding:
-                const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: Colors.black38,
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: const Text(
-              'Two fingers to rotate — snaps to horizontal / vertical',
-              style: TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _bottomBar() {
+    // Google Photos hand-off is Android-only; hide it elsewhere (e.g. iOS).
+    final canOpenInGooglePhotos =
+        context.read<GalleryController>().canOpenInGooglePhotos;
     return Positioned(
       left: 0,
       right: 0,
@@ -278,11 +281,12 @@ class _PhotoViewPageState extends State<PhotoViewPage> {
               label: 'Info',
               onTap: _showInfo,
             ),
-            _BarButton(
-              icon: Icons.photo_library_outlined,
-              label: 'Google Photos',
-              onTap: _openInGooglePhotos,
-            ),
+            if (canOpenInGooglePhotos)
+              _BarButton(
+                icon: Icons.photo_library_outlined,
+                label: 'Google Photos',
+                onTap: _openInGooglePhotos,
+              ),
             _BarButton(
               icon: Icons.delete_outline,
               label: 'Delete',
